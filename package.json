@@ -1,10 +1,10 @@
 {
   "name": "anonymous-apex-notebook",
-  "displayName": "Anonymous Apex Notebook",
-  "description": "Notebook support for executing anonymous apex scripts and SOQL queries",
+  "displayName": "Anonymous Apex Notebook Extended",
+  "description": "Notebook support for executing anonymous apex scripts and SOQL queries with enhanced log analysis",
   "version": "0.6.0",
   "repository": {
-    "url": "https://github.com/jake-kirkman/vscode-ext-apex-notebook"
+    "url": "https://github.com/leshchukandrej/vscode-ext-apex-notebook"
   },
   "icon": "media/package-icon.png",
   "engines": {
@@ -22,10 +22,20 @@
     "Salesforce"
   ],
   "author": {
-    "name": "Jake Kirkman"
+    "name": "Andrii Leshchuk"
   },
-  "publisher": "JakeKirkman",
-  "activationEvents": [],
+  "publisher": "AndriiLeshchuk",
+  "contributors": [
+    {
+      "name": "Jake Kirkman",
+      "url": "https://github.com/jake-kirkman"
+    }
+  ],
+  "activationEvents": [
+    "onNotebook:anon-apex-notebook",
+    "onCommand:anonymous-apex-notebook.openInApexLogAnalyzer",
+    "onCommand:anonymous-apex-notebook.openLogFromCell"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -33,6 +43,21 @@
         "command": "anonymous-apex-notebook.create-apex-notebook",
         "title": "New Apex Notebook",
         "category": "Create"
+      },
+      {
+        "command": "anonymous-apex-notebook.selectOrg",
+        "title": "Select Target Org for Cell",
+        "category": "Apex Notebook"
+      },
+      {
+        "command": "anonymous-apex-notebook.openInApexLogAnalyzer",
+        "title": "Open in Apex Log Analyzer",
+        "category": "Apex Notebook"
+      },
+      {
+        "command": "anonymous-apex-notebook.openLogFromCell",
+        "title": "Open Log in Apex Log Analyzer",
+        "category": "Apex Notebook"
       }
     ],
     "configuration": {
