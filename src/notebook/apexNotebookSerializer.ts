@@ -1,10 +1,14 @@
 import { TextEncoder, TextDecoder } from 'util';
 import * as vscode from 'vscode';
+import * as SalesforceHandler from '../handlers/salesforceHandler';
 
 interface RawNotebookCell {
     source: string[];
     cellType: 'code' | 'markdown';
     language: string;
+    metadata?: {
+        targetOrg?: string;
+    };
 }
 
 export default class ApexNotebookSerializer implements vscode.NotebookSerializer {
@@ -22,16 +26,15 @@ export default class ApexNotebookSerializer implements vscode.NotebookSerializer
         raw = [];
       }
   
-      const cells = raw.map(
-        item =>
-          new vscode.NotebookCellData(
-            item.cellType === 'code'
-              ? vscode.NotebookCellKind.Code
-              : vscode.NotebookCellKind.Markup,
-            item.source.join('\n'),
-            item.cellType === 'code' ? item.language : 'markdown'
-          )
-      );
+      const cells = raw.map(item => {
+        const cell = new vscode.NotebookCellData(
+          item.cellType === 'code' ? vscode.NotebookCellKind.Code : vscode.NotebookCellKind.Markup,
+          item.source.join('\n'),
+          item.cellType === 'code' ? item.language : 'markdown'
+        );
+        cell.metadata = item.metadata;
+        return cell;
+      });
   
       return new vscode.NotebookData(cells);
     }
@@ -46,7 +49,8 @@ export default class ApexNotebookSerializer implements vscode.NotebookSerializer
         contents.push({
           cellType: cell.kind === vscode.NotebookCellKind.Code ? 'code' : 'markdown',
           source: cell.value.split(/\r?\n/g),
-          language: cell.languageId
+          language: cell.languageId,
+          metadata: cell.metadata
         });
       }
   
