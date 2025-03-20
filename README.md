@@ -12,6 +12,7 @@ Allows the creation of an "Apex Notebook" which enables the execution of Anonymo
 - **Debug Statement Highlighting**: Improved display of debug statements
 - **Error Reporting**: Better visualization of errors and exceptions
 - **Raw Log Toggle**: Easily switch between analyzed and raw log views
+- **Org Selector**: Add the ability to select the targhet org for each Notebook Block
 
 ![Demo](media/demo.gif)
 
