@@ -52,6 +52,9 @@ export class LogAnalyzerHandler {
      * Analyzes an Apex execution log and extracts useful information
      */
     public static analyzeApexLog(log: string): LogAnalysis {
+        // Clean the log by removing executed anonymous code sections
+        log = this.removeExecutedAnonymousCode(log);
+        
         const analysis = this.initializeAnalysis();
         const lines = log.split('\n');
         let startTime = 0;
@@ -336,7 +339,7 @@ export class LogAnalyzerHandler {
         analysis.timeline.push({ 
             event: 'Debug Log', 
             timeMs: relativeTimeMs,
-            details: `Line ${lineNumber}: ${message.split('\n')[0]}${message.includes('\n') ? '...' : ''}`
+            details: `Line ${lineNumber}: ${message}`
         });
         
         return newIndex;
@@ -701,6 +704,9 @@ export class LogAnalyzerHandler {
         const executionDatetime = this.extractExecutionDatetime(rawLogText);
         const formattedDatetime = executionDatetime ? executionDatetime.toLocaleString() : 'Unknown time';
         
+        // Clean the raw log text to remove Execute Anonymous sections
+        const cleanedRawLogText = this.removeExecutedAnonymousCode(rawLogText);
+        
         // Base 64 encode for data storage (not used directly, but useful to have)
         const encodedLogText = Buffer.from(rawLogText).toString('base64');
         
@@ -724,7 +730,7 @@ export class LogAnalyzerHandler {
                     ${this.generateTimelineSection(analysis)}
                 </div>
                 
-                ${this.generateRawLogView(rawLogText, uniqueId)}
+                ${this.generateRawLogView(cleanedRawLogText, uniqueId)}
                 
                 ${this.generateLogDataScript(encodedLogText, uniqueId)}
             </div>
@@ -1286,7 +1292,29 @@ export class LogAnalyzerHandler {
         <div id="rawLogView_${uniqueId}">
             <details>
                 <summary>📄 Full Log</summary>
-                <div class="panel monospace" style="margin-bottom: 15px; white-space: pre-wrap; overflow-x: auto; max-height: 500px; overflow-y: auto;">
+                <div class="search-container" style="margin-bottom: 10px; display: flex; align-items: center;">
+                    <input 
+                        type="text" 
+                        id="searchInput_${uniqueId}" 
+                        placeholder="Search in log..." 
+                        style="flex: 1; padding: 4px 8px; border-radius: 4px; border: 1px solid var(--vscode-input-border); background-color: var(--vscode-input-background); color: var(--vscode-input-foreground);"
+                        onkeydown="if(event.key === 'Enter') { event.preventDefault(); document.getElementById('searchNext_${uniqueId}').click(); }"
+                    />
+                    <button 
+                        id="searchPrev_${uniqueId}" 
+                        title="Previous match"
+                        style="margin-left: 4px; padding: 4px 8px; background-color: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 4px; cursor: pointer;"
+                        onclick="searchPrev_${uniqueId}()"
+                    >◀</button>
+                    <button 
+                        id="searchNext_${uniqueId}" 
+                        title="Next match"
+                        style="margin-left: 4px; padding: 4px 8px; background-color: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 4px; cursor: pointer;"
+                        onclick="searchNext_${uniqueId}()"
+                    >▶</button>
+                    <span id="searchInfo_${uniqueId}" style="margin-left: 8px; font-size: 12px; color: var(--vscode-descriptionForeground);"></span>
+                </div>
+                <div id="logContent_${uniqueId}" class="panel monospace" style="margin-bottom: 15px; white-space: pre-wrap; overflow-x: auto; max-height: 500px; overflow-y: auto;">
                     ${this.escapeHtml(rawLogText)}
                 </div>
             </details>
@@ -1299,12 +1327,19 @@ export class LogAnalyzerHandler {
     private static generateJavaScript(uniqueId: string): string {
         return `
         <script>
+            // Variables for search functionality
+            let currentMatchIndex_${uniqueId} = -1;
+            let matches_${uniqueId} = [];
+            
             // Calculate content height once loaded
             document.addEventListener('DOMContentLoaded', function() {
                 const content = document.getElementById('collapsible-content-${uniqueId}');
                 if (content) {
                     content.style.maxHeight = content.scrollHeight + 'px';
                 }
+                
+                // Initialize search functionality
+                initSearch_${uniqueId}();
             });
             
             // Collapse/expand functionality
@@ -1324,6 +1359,256 @@ export class LogAnalyzerHandler {
                     icon.classList.add('collapsed');
                 }
             }
-        </script>`;
+            
+            // Function to escape regex special characters
+            function escapeRegExp_${uniqueId}(string) {
+                return string.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+            }
+            
+            // Initialize search functionality
+            function initSearch_${uniqueId}() {
+                const searchInput = document.getElementById('searchInput_${uniqueId}');
+                if (!searchInput) return;
+                
+                // Add input event listener
+                searchInput.addEventListener('input', function() {
+                    performSearch_${uniqueId}(this.value);
+                });
+            }
+            
+            // Perform search in log content
+            function performSearch_${uniqueId}(searchText) {
+                const logContent = document.getElementById('logContent_${uniqueId}');
+                const searchInfo = document.getElementById('searchInfo_${uniqueId}');
+                if (!logContent || !searchInfo) return;
+                
+                // Store the search text for comparison in next/prev functions
+                window['logContent_${uniqueId}_lastSearchText'] = searchText.trim();
+                
+                // Reset content and variables
+                logContent.innerHTML = logContent.textContent.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                currentMatchIndex_${uniqueId} = -1;
+                matches_${uniqueId} = [];
+                searchInfo.textContent = '';
+                
+                if (!searchText || searchText.trim() === '') return;
+                
+                try {
+                    // Create regex pattern with escaped special characters
+                    const pattern = escapeRegExp_${uniqueId}(searchText);
+                    const regex = new RegExp(pattern, 'gi');
+                    const content = logContent.textContent;
+                    
+                    // Find all matches
+                    let match;
+                    while ((match = regex.exec(content)) !== null) {
+                        // Prevent infinite loops with zero-length matches
+                        if (match.index === regex.lastIndex) {
+                            regex.lastIndex++;
+                        }
+                        matches_${uniqueId}.push(match.index);
+                    }
+                    
+                    // Display match count
+                    if (matches_${uniqueId}.length > 0) {
+                        currentMatchIndex_${uniqueId} = 0;
+                        searchInfo.textContent = 'Match 1 of ' + matches_${uniqueId}.length;
+                        
+                        // Highlight all matches and scroll to first match
+                        highlightMatches_${uniqueId}(searchText);
+                    } else {
+                        searchInfo.textContent = 'No matches found';
+                    }
+                } catch (e) {
+                    console.error('Search error:', e);
+                    searchInfo.textContent = 'Search error';
+                }
+            }
+            
+            // Highlight all search matches in the content
+            function highlightMatches_${uniqueId}(searchText) {
+                const logContent = document.getElementById('logContent_${uniqueId}');
+                if (!logContent || matches_${uniqueId}.length === 0) return;
+                
+                const content = logContent.textContent;
+                let result = '';
+                let lastIndex = 0;
+                
+                // Process each match
+                for (let i = 0; i < matches_${uniqueId}.length; i++) {
+                    const matchStart = matches_${uniqueId}[i];
+                    const matchEnd = matchStart + searchText.length;
+                    
+                    // Add text before the match
+                    result += content.substring(lastIndex, matchStart).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    
+                    // Add the highlighted match
+                    const matchClass = (i === currentMatchIndex_${uniqueId}) ? 'current-match' : 'match';
+                    result += '<span class="' + matchClass + '">' + 
+                              content.substring(matchStart, matchEnd).replace(/</g, '&lt;').replace(/>/g, '&gt;') + 
+                              '</span>';
+                    
+                    lastIndex = matchEnd;
+                }
+                
+                // Add remaining text after the last match
+                result += content.substring(lastIndex).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                
+                // Update content
+                logContent.innerHTML = result;
+                
+                // Scroll to current match
+                scrollToMatch_${uniqueId}();
+            }
+            
+            // Navigate to next match
+            function searchNext_${uniqueId}() {
+                // Always get the current search text
+                const searchInput = document.getElementById('searchInput_${uniqueId}');
+                if (!searchInput || searchInput.value.trim() === '') return;
+                
+                // If search text has changed or no previous search, perform a new search
+                const currentSearchText = searchInput.value.trim();
+                const storedSearchText = window['logContent_${uniqueId}_lastSearchText'] || '';
+                
+                if (currentSearchText !== storedSearchText || matches_${uniqueId}.length === 0) {
+                    performSearch_${uniqueId}(currentSearchText);
+                    // Store the current search text as a variable
+                    window['logContent_${uniqueId}_lastSearchText'] = currentSearchText;
+                    return;
+                }
+                
+                // If we have matches and the search text hasn't changed, move to next match
+                currentMatchIndex_${uniqueId} = (currentMatchIndex_${uniqueId} + 1) % matches_${uniqueId}.length;
+                updateMatchHighlight_${uniqueId}();
+            }
+            
+            // Navigate to previous match
+            function searchPrev_${uniqueId}() {
+                // Always get the current search text
+                const searchInput = document.getElementById('searchInput_${uniqueId}');
+                if (!searchInput || searchInput.value.trim() === '') return;
+                
+                // If search text has changed or no previous search, perform a new search
+                const currentSearchText = searchInput.value.trim();
+                const storedSearchText = window['logContent_${uniqueId}_lastSearchText'] || '';
+                
+                if (currentSearchText !== storedSearchText || matches_${uniqueId}.length === 0) {
+                    performSearch_${uniqueId}(currentSearchText);
+                    // Store the current search text as a variable
+                    window['logContent_${uniqueId}_lastSearchText'] = currentSearchText;
+                    return;
+                }
+                
+                // If we have matches and the search text hasn't changed, move to previous match
+                currentMatchIndex_${uniqueId} = (currentMatchIndex_${uniqueId} - 1 + matches_${uniqueId}.length) % matches_${uniqueId}.length;
+                updateMatchHighlight_${uniqueId}();
+            }
+            
+            // Update highlight for current match
+            function updateMatchHighlight_${uniqueId}() {
+                const searchInfo = document.getElementById('searchInfo_${uniqueId}');
+                if (!searchInfo) return;
+                
+                // Update match counter
+                searchInfo.textContent = 'Match ' + (currentMatchIndex_${uniqueId} + 1) + ' of ' + matches_${uniqueId}.length;
+                
+                // Update highlight classes
+                const logContent = document.getElementById('logContent_${uniqueId}');
+                if (!logContent) return;
+                
+                const matchElements = logContent.querySelectorAll('.match, .current-match');
+                for (let i = 0; i < matchElements.length; i++) {
+                    matchElements[i].className = (i === currentMatchIndex_${uniqueId}) ? 'current-match' : 'match';
+                }
+                
+                // Scroll to current match
+                scrollToMatch_${uniqueId}();
+            }
+            
+            // Scroll to current match
+            function scrollToMatch_${uniqueId}() {
+                const logContent = document.getElementById('logContent_${uniqueId}');
+                if (!logContent) return;
+                
+                const currentMatch = logContent.querySelector('.current-match');
+                if (currentMatch) {
+                    currentMatch.scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'center'
+                    });
+                }
+            }
+        </script>
+        
+        <style>
+            .match {
+                background-color: var(--vscode-editor-findMatchHighlightBackground, rgba(255, 255, 0, 0.3));
+                border: 1px solid var(--vscode-editor-findMatchHighlightBorder, transparent);
+                border-radius: 2px;
+            }
+            .current-match {
+                background-color: var(--vscode-editor-findMatchBackground, rgba(255, 153, 0, 0.6));
+                border: 1px solid var(--vscode-editor-findMatchBorder, transparent);
+                border-radius: 2px;
+                font-weight: bold;
+            }
+        </style>`;
+    }
+
+    /**
+     * Removes the executed anonymous code sections from the log
+     * These sections typically appear at the beginning of the log and show the code being executed
+     */
+    private static removeExecutedAnonymousCode(log: string): string {
+        // First check if we have any Execute Anonymous lines - quick return if not
+        if (!log.includes('Execute Anonymous:')) {
+            return log;
+        }
+        
+        // Split the log into lines for processing
+        const lines = log.split('\n');
+        const filteredLines = [];
+        let inExecuteAnonymous = false;
+        let firstTimestampFound = false;
+        
+        // Process each line
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            
+            // Check for the first timestamp pattern which indicates start of actual log data
+            if (!firstTimestampFound && line.match(/^\d{1,2}:\d{2}:\d{2}\.\d+\|/)) {
+                firstTimestampFound = true;
+                filteredLines.push(lines[i]); // Keep the timestamp line
+                continue;
+            }
+            
+            // If we've found the first timestamp, include all subsequent lines
+            if (firstTimestampFound) {
+                filteredLines.push(lines[i]);
+                continue;
+            }
+            
+            // For lines before the first timestamp:
+            
+            // Skip any lines that start with "Execute Anonymous:"
+            if (line.startsWith('Execute Anonymous:')) {
+                inExecuteAnonymous = true;
+                continue;
+            }
+            
+            // Skip empty lines immediately after Execute Anonymous sections
+            if (inExecuteAnonymous && line === '') {
+                continue;
+            }
+            
+            // For other non-Execute Anonymous lines before the timestamp (like log level settings)
+            if (!line.startsWith('Execute Anonymous:') && line !== '') {
+                inExecuteAnonymous = false; // Reset the flag
+                filteredLines.push(lines[i]); // Keep config lines and other log header info
+            }
+        }
+        
+        return filteredLines.join('\n');
     }
 } 
