@@ -44,12 +44,141 @@ export interface LogAnalysis {
     totalExecutionTimeMs: number;
 }
 
+/**
+ * Handler for analyzing Apex execution logs
+ */
 export class LogAnalyzerHandler {
     /**
      * Analyzes an Apex execution log and extracts useful information
      */
     public static analyzeApexLog(log: string): LogAnalysis {
-        const analysis: LogAnalysis = {
+        const analysis = this.initializeAnalysis();
+        const lines = log.split('\n');
+        let startTime = 0;
+        let endTime = 0;
+        
+        // Track limits
+        const limitMap = new Map<string, { used: number; total: number }>();
+        
+        // Track the last USER_DEBUG line for collecting continued content
+        let lastDebugLineIndex: number = -1;
+        
+        // Process each line of the log
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            if (!line.trim()) continue;
+            
+            try {
+                // Handle multi-line debug statements
+                if (this.isPartOfPreviousDebugLine(lastDebugLineIndex, line)) {
+                    this.processContinuedDebugLine(analysis, line);
+                    continue;
+                }
+                
+                // Parse the log line
+                const parts = line.split('|');
+                if (parts.length < 2) continue;
+                
+                const timestamp = parts[0];
+                const eventType = parts[1];
+                
+                // Get the current time in seconds
+                const currentTime = parseFloat(timestamp);
+                
+                // Calculate relative time from the start in milliseconds
+                const relativeTimeMs = Math.round((currentTime - startTime) * 1000);
+                
+                // Process based on the event type
+                if (eventType.includes('EXECUTION_STARTED')) {
+                    startTime = currentTime;
+                    this.processExecutionStarted(analysis);
+                    lastDebugLineIndex = -1;
+                } 
+                else if (eventType.includes('EXECUTION_FINISHED')) {
+                    endTime = currentTime;
+                    this.processExecutionFinished(analysis, startTime, endTime);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('SOQL_EXECUTE_BEGIN')) {
+                    this.processSoqlQuery(analysis, parts, relativeTimeMs);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('DML_BEGIN')) {
+                    this.processDmlOperation(analysis, parts, relativeTimeMs);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('USER_DEBUG')) {
+                    lastDebugLineIndex = i;
+                    i = this.processUserDebug(analysis, lines, i, parts, relativeTimeMs, timestamp);
+                }
+                else if (eventType.includes('HEAP_ALLOCATE')) {
+                    this.processHeapAllocation(analysis, line);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('EXCEPTION_THROWN') || eventType.includes('FATAL_ERROR')) {
+                    this.processException(analysis, parts, relativeTimeMs, lines, i);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('SYSTEM_METHOD_ENTRY')) {
+                    this.processMethodEntry(analysis, parts, relativeTimeMs);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('SYSTEM_METHOD_EXIT')) {
+                    this.processMethodExit(analysis, parts, relativeTimeMs);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('LIMIT_USAGE_FOR_NS')) {
+                    this.processLimitUsage(analysis, limitMap, parts);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('CUMULATIVE_LIMIT_USAGE')) {
+                    this.processCumulativeLimits(analysis, limitMap, parts, relativeTimeMs);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('CUMULATIVE_PROFILING')) {
+                    this.processProfilingData(analysis, parts);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('CODE_COVERAGE')) {
+                    this.processCodeCoverage(analysis, parts);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('SYSTEM_MODE_ENTER') || eventType.includes('SYSTEM_MODE_EXIT')) {
+                    this.processSystemMode(analysis, eventType, relativeTimeMs);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('CONSTRUCTOR_ENTRY') || eventType.includes('CONSTRUCTOR_EXIT')) {
+                    this.processConstructor(analysis, eventType, parts, relativeTimeMs);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('METHOD_ENTRY') || eventType.includes('METHOD_EXIT')) {
+                    this.processCustomMethod(analysis, eventType, parts, relativeTimeMs);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('SOQL_EXECUTE_END')) {
+                    this.processSoqlEnd(analysis, parts, relativeTimeMs);
+                    lastDebugLineIndex = -1;
+                }
+                else if (eventType.includes('DML_END')) {
+                    this.processDmlEnd(analysis, parts, relativeTimeMs);
+                    lastDebugLineIndex = -1;
+                }
+                
+            } catch (error) {
+                console.error(`Error processing log line ${i}: ${error}`);
+                // Continue to next line even if there was an error
+            }
+        }
+        
+        // Finalize analysis and return results
+        return this.finalizeAnalysis(analysis, limitMap);
+    }
+
+    /**
+     * Initialize a new log analysis object
+     */
+    private static initializeAnalysis(): LogAnalysis {
+        return {
             summary: {
                 totalTimeMs: 0,
                 dbTimeMs: 0,
@@ -67,163 +196,485 @@ export class LogAnalyzerHandler {
             hasCoverageInfo: false,
             totalExecutionTimeMs: 0
         };
-        
-        const lines = log.split('\n');
-        let startTime = 0;
-        let endTime = 0;
-        
-        // Track limits
-        const limitMap = new Map<string, { used: number; total: number }>();
-        
-        // Process each line of the log
-        for (const line of lines) {
-            if (!line.trim()) continue;
+    }
+
+    /**
+     * Check if a line is part of a previous debug line
+     */
+    private static isPartOfPreviousDebugLine(lastDebugLineIndex: number, line: string): boolean {
+        return lastDebugLineIndex >= 0 && !line.match(/^\d+:\d+:\d+/);
+    }
+
+    /**
+     * Process a continued debug line
+     */
+    private static processContinuedDebugLine(analysis: LogAnalysis, line: string): void {
+        if (analysis.debugLines.length > 0) {
+            // Append to the last debug message, preserving the line as-is (even if empty)
+            const lastDebug = analysis.debugLines[analysis.debugLines.length - 1];
             
-            try {
-                // Parse the log line
-                const parts = line.split('|');
-                if (parts.length < 2) continue;
-                
-                const timestamp = parts[0];
-                const eventType = parts[1];
-                
-                // Get the current time in seconds
-                const currentTime = parseFloat(timestamp);
-                
-                // Calculate relative time from the start in milliseconds
-                const relativeTimeMs = Math.round((currentTime - startTime) * 1000);
-                
-                // Process based on the event type
-                if (eventType.includes('EXECUTION_STARTED')) {
-                    startTime = currentTime;
-                    analysis.timeline.push({ event: 'Execution Started', timeMs: 0 });
-                } 
-                else if (eventType.includes('EXECUTION_FINISHED')) {
-                    endTime = currentTime;
-                    analysis.totalExecutionTimeMs = Math.round((endTime - startTime) * 1000);
-                    analysis.summary.totalTimeMs = analysis.totalExecutionTimeMs;
-                    analysis.timeline.push({ event: 'Execution Finished', timeMs: analysis.totalExecutionTimeMs });
+            // Remove "DEBUG|" prefix if present before adding to the debug message
+            const cleanedLine = line.replace(/^DEBUG\|/, '');
+            lastDebug.message += '\n' + cleanedLine;
+            
+            // Also update the timeline
+            for (let j = analysis.timeline.length - 1; j >= 0; j--) {
+                const event = analysis.timeline[j];
+                if (event.event === 'Debug Log') {
+                    // Update the details in timeline
+                    const lineNumber = lastDebug.lineNumber;
+                    event.details = `Line ${lineNumber}: ${lastDebug.message.split('\n')[0]}...`;
+                    break;
                 }
-                else if (eventType.includes('SOQL_EXECUTE_BEGIN')) {
-                    analysis.summary.numSoqlQueries++;
-                    const queryDetails = parts.slice(2).join('|').trim();
-                    analysis.timeline.push({ 
-                        event: 'SOQL Query', 
-                        timeMs: relativeTimeMs,
-                        details: queryDetails
-                    });
-                }
-                else if (eventType.includes('DML_BEGIN')) {
-                    analysis.summary.numDmlStatements++;
-                    analysis.timeline.push({ 
-                        event: 'DML Operation', 
-                        timeMs: relativeTimeMs,
-                        details: parts.slice(2).join('|').trim()
-                    });
-                }
-                else if (eventType.includes('USER_DEBUG')) {
-                    const lineMatch = parts[2].match(/\[(\d+)\]/);
-                    const lineNumber = lineMatch ? parseInt(lineMatch[1]) : 0;
-                    const message = parts.slice(3).join('|').trim();
-                    
-                    analysis.debugLines.push({ 
-                        lineNumber, 
-                        message, 
-                        timestamp 
-                    });
-                    
-                    analysis.timeline.push({ 
-                        event: 'Debug Log', 
-                        timeMs: relativeTimeMs,
-                        details: `Line ${lineNumber}: ${message}`
-                    });
-                }
-                else if (eventType.includes('HEAP_ALLOCATE')) {
-                    const heapMatch = line.match(/Bytes:(\d+)/);
-                    if (heapMatch) {
-                        const heapSize = parseInt(heapMatch[1]);
-                        if (heapSize > analysis.summary.heapSize) {
-                            analysis.summary.heapSize = heapSize;
-                        }
-                    }
-                }
-                else if (eventType.includes('EXCEPTION_THROWN') || eventType.includes('FATAL_ERROR')) {
-                    analysis.errors.push({ 
-                        message: parts.slice(2).join('|').trim() 
-                    });
-                    
-                    analysis.timeline.push({ 
-                        event: 'Error', 
-                        timeMs: relativeTimeMs,
-                        details: parts.slice(2).join('|').trim()
-                    });
-                }
-                else if (eventType.includes('LIMIT_USAGE') || eventType.includes('LIMIT_USAGE_FOR_NS')) {
-                    const limitContent = parts.slice(2).join('|');
-                    // Format is typically: "Number of SOQL queries: 3 out of 100"
-                    const limitMatch = limitContent.match(/([^:]+):\s+(\d+)\s+out of\s+(\d+)/);
-                    if (limitMatch) {
-                        const limitName = limitMatch[1].trim();
-                        const used = parseInt(limitMatch[2]);
-                        const total = parseInt(limitMatch[3]);
-                        
-                        limitMap.set(limitName, { used, total });
-                        
-                        analysis.governorLimits.push({
-                            name: limitName,
-                            usage: used,
-                            total: total
-                        });
-                    }
-                }
-                else if (eventType.includes('METHOD_ENTRY') && parts[2] && parts[2].includes('Database.')) {
-                    analysis.summary.numDatabaseCalls++;
-                }
-                else if (eventType.includes('CODE_COVERAGE')) {
-                    const coverageInfo = parts.slice(2).join('|').trim();
-                    analysis.hasCoverageInfo = true;
-                    
-                    // Try to extract coverage percentage
-                    const percentMatch = coverageInfo.match(/(\d+)%/);
-                    if (percentMatch) {
-                        if (!analysis.codeCoverage) {
-                            analysis.codeCoverage = {
-                                coveragePercentage: parseInt(percentMatch[1]),
-                                linesCovered: 0,
-                                linesTotal: 0,
-                                uncoveredLines: []
-                            };
-                        }
-                    }
-                    
-                    analysis.timeline.push({
-                        event: 'Code Coverage',
-                        timeMs: relativeTimeMs,
-                        details: coverageInfo
-                    });
-                }
-            } catch (error) {
-                // Skip lines that can't be processed
-                continue;
+            }
+        }
+    }
+
+    /**
+     * Process execution started event
+     */
+    private static processExecutionStarted(analysis: LogAnalysis): void {
+        analysis.timeline.push({ event: 'Execution Started', timeMs: 0 });
+    }
+
+    /**
+     * Process execution finished event
+     */
+    private static processExecutionFinished(analysis: LogAnalysis, startTime: number, endTime: number): void {
+        analysis.totalExecutionTimeMs = Math.round((endTime - startTime) * 1000);
+        analysis.summary.totalTimeMs = analysis.totalExecutionTimeMs;
+        analysis.timeline.push({ event: 'Execution Finished', timeMs: analysis.totalExecutionTimeMs });
+    }
+
+    /**
+     * Process SOQL query event
+     */
+    private static processSoqlQuery(analysis: LogAnalysis, parts: string[], relativeTimeMs: number): void {
+        analysis.summary.numSoqlQueries++;
+        const queryDetails = parts.slice(2).join('|').trim();
+        analysis.timeline.push({ 
+            event: 'SOQL Query', 
+            timeMs: relativeTimeMs,
+            details: queryDetails
+        });
+    }
+
+    /**
+     * Process DML operation event
+     */
+    private static processDmlOperation(analysis: LogAnalysis, parts: string[], relativeTimeMs: number): void {
+        analysis.summary.numDmlStatements++;
+        analysis.timeline.push({ 
+            event: 'DML Operation', 
+            timeMs: relativeTimeMs,
+            details: parts.slice(2).join('|').trim()
+        });
+    }
+
+    /**
+     * Helper method to extract content until the next timestamp line
+     * This is used by both debug and error processing to capture multi-line content
+     */
+    private static extractContentUntilNextTimestamp(lines: string[], startIndex: number): { content: string, newIndex: number } {
+        const extractedLines = [];
+        let currentIndex = startIndex + 1;
+        
+        while (currentIndex < lines.length) {
+            const line = lines[currentIndex];
+            
+            // If the line starts with a timestamp pattern (like "12:02:53.23"), stop collecting
+            if (line.match(/^\d+:\d+:\d+/)) {
+                break;
+            }
+
+            extractedLines.push(line);
+            currentIndex++;
+        }
+        
+        // Return the collected content and the new index
+        return {
+            content: extractedLines.join('\n'),
+            newIndex: currentIndex - 1 // -1 because the loop will increment once more
+        };
+    }
+
+    /**
+     * Process user debug event
+     */
+    private static processUserDebug(
+        analysis: LogAnalysis, 
+        lines: string[], 
+        currentIndex: number, 
+        parts: string[], 
+        relativeTimeMs: number, 
+        timestamp: string
+    ): number {
+        const lineMatch = parts[2].match(/\[(\d+)\]/);
+        const lineNumber = lineMatch ? parseInt(lineMatch[1]) : 0;
+        
+        // Get the raw debug message by joining all remaining parts without trimming
+        let message = parts.slice(3).join('|');
+              
+        // Remove "DEBUG|" prefix if present, but preserve other whitespace
+        message = message.replace(/^DEBUG\|/, '');
+        
+        // Extract additional content until the next timestamp
+        const { content, newIndex } = this.extractContentUntilNextTimestamp(lines, currentIndex);
+        
+        // Append any extracted content to the message
+
+        // if (content) {
+            message += '\n' + content;
+        // }
+              
+        analysis.debugLines.push({ 
+            lineNumber, 
+            message, 
+            timestamp 
+        });
+        
+        analysis.timeline.push({ 
+            event: 'Debug Log', 
+            timeMs: relativeTimeMs,
+            details: `Line ${lineNumber}: ${message.split('\n')[0]}${message.includes('\n') ? '...' : ''}`
+        });
+        
+        return newIndex;
+    }
+
+    /**
+     * Process heap allocation event
+     */
+    private static processHeapAllocation(analysis: LogAnalysis, line: string): void {
+        const heapMatch = line.match(/Bytes:(\d+)/);
+        if (heapMatch) {
+            const heapSize = parseInt(heapMatch[1]);
+            if (heapSize > analysis.summary.heapSize) {
+                analysis.summary.heapSize = heapSize;
+            }
+        }
+    }
+
+    /**
+     * Process exception event
+     */
+    private static processException(
+        analysis: LogAnalysis, 
+        parts: string[], 
+        relativeTimeMs: number, 
+        lines: string[], 
+        currentIndex: number
+    ): void {
+        const errorMessage = parts.slice(2).join('|').trim();
+        
+        // Extract line and column numbers if present in the error message
+        let lineNumber: number | undefined;
+        let columnNumber: number | undefined;
+        
+        // Look for line/column patterns like "line 15, column 32" or similar
+        const lineColMatch = errorMessage.match(/line\s+(\d+)(?:,\s*column\s+(\d+))?/i);
+        if (lineColMatch) {
+            lineNumber = parseInt(lineColMatch[1]);
+            if (lineColMatch[2]) {
+                columnNumber = parseInt(lineColMatch[2]);
             }
         }
         
-        // Process the limits and convert to array
-        for (const [name, { used, total }] of limitMap.entries()) {
-            analysis.limits.push({
-                name,
-                used,
-                total,
-                percentage: Math.round((used / total) * 100)
-            });
+        // Extract stack trace content until the next timestamp
+        const { content: stackTrace, newIndex } = this.extractContentUntilNextTimestamp(lines, currentIndex);
+        
+        // Create the error object
+        const errorObj: {
+            message: string;
+            lineNumber?: number;
+            columnNumber?: number;
+            stackTrace?: string;
+        } = { 
+            message: errorMessage,
+            lineNumber,
+            columnNumber
+        };
+        
+        if (stackTrace) {
+            errorObj.stackTrace = stackTrace;
         }
         
-        // Sort limits by percentage (highest first)
+        analysis.errors.push(errorObj);
+        
+        analysis.timeline.push({ 
+            event: 'Error', 
+            timeMs: relativeTimeMs,
+            details: errorMessage
+        });
+    }
+
+    /**
+     * Process method entry event
+     */
+    private static processMethodEntry(analysis: LogAnalysis, parts: string[], relativeTimeMs: number): void {
+        const methodName = parts[2] || 'Unknown Method';
+        analysis.timeline.push({ 
+            event: 'Method Entry', 
+            timeMs: relativeTimeMs,
+            details: methodName
+        });
+    }
+
+    /**
+     * Process method exit event
+     */
+    private static processMethodExit(analysis: LogAnalysis, parts: string[], relativeTimeMs: number): void {
+        const methodName = parts[2] || 'Unknown Method';
+        analysis.timeline.push({ 
+            event: 'Method Exit', 
+            timeMs: relativeTimeMs,
+            details: methodName
+        });
+    }
+
+    /**
+     * Process limit usage event
+     */
+    private static processLimitUsage(
+        analysis: LogAnalysis, 
+        limitMap: Map<string, { used: number; total: number }>, 
+        parts: string[]
+    ): void {
+        // Parse LIMIT_USAGE information
+        for (let j = 2; j < parts.length; j++) {
+            const limitPart = parts[j].trim();
+            if (!limitPart) continue;
+            
+            const limitMatch = limitPart.match(/([^:]+):\s*(\d+)\s*of\s*(\d+)/);
+            if (limitMatch) {
+                const limitName = limitMatch[1].trim();
+                const used = parseInt(limitMatch[2]);
+                const total = parseInt(limitMatch[3]);
+                
+                // Store in map for later processing
+                limitMap.set(limitName, { used, total });
+            }
+        }
+    }
+
+    /**
+     * Process cumulative limits event
+     */
+    private static processCumulativeLimits(
+        analysis: LogAnalysis, 
+        limitMap: Map<string, { used: number; total: number }>, 
+        parts: string[],
+        relativeTimeMs: number
+    ): void {
+        // Process all limits at once
+        for (let j = 3; j < parts.length; j++) {
+            const limitPart = parts[j].trim();
+            if (!limitPart) continue;
+            
+            const limitMatch = limitPart.match(/([^:]+):\s*(\d+)\s*of\s*(\d+)/);
+            if (limitMatch) {
+                const limitName = limitMatch[1].trim();
+                const used = parseInt(limitMatch[2]);
+                const total = parseInt(limitMatch[3]);
+                
+                // Store in map for later processing
+                limitMap.set(limitName, { used, total });
+                
+                // Update governor limits data
+                analysis.governorLimits.push({
+                    name: limitName,
+                    usage: used,
+                    total: total
+                });
+                
+                // Add to timeline for significant limit usage (>50%)
+                if (used > 0 && (used / total) > 0.5) {
+                    const percentage = Math.round((used / total) * 100);
+                    analysis.timeline.push({
+                        event: 'High Limit Usage',
+                        timeMs: relativeTimeMs,
+                        details: `${limitName}: ${used} of ${total} (${percentage}%)`
+                    });
+                }
+            }
+        }
+    }
+
+    /**
+     * Process profiling data event
+     */
+    private static processProfilingData(analysis: LogAnalysis, parts: string[]): void {
+        // Placeholder for profiling data processing
+        // This would extract method execution times and call hierarchy
+    }
+
+    /**
+     * Process code coverage event
+     */
+    private static processCodeCoverage(analysis: LogAnalysis, parts: string[]): void {
+        analysis.hasCoverageInfo = true;
+        
+        // Simple coverage detection - could be expanded for more detailed coverage information
+        const coverageText = parts.slice(2).join('|');
+        
+        // Extract coverage percentage if available
+        const percentMatch = coverageText.match(/(\d+)%/);
+        if (percentMatch) {
+            const coveragePercentage = parseInt(percentMatch[1]);
+            
+            if (!analysis.codeCoverage) {
+                analysis.codeCoverage = {
+                    coveragePercentage: coveragePercentage,
+                    linesCovered: 0,
+                    linesTotal: 0,
+                    uncoveredLines: []
+                };
+            } else {
+                analysis.codeCoverage.coveragePercentage = coveragePercentage;
+            }
+        }
+        
+        // Extract covered/uncovered lines
+        const linesMatch = coverageText.match(/(\d+)\/(\d+)/);
+        if (linesMatch) {
+            const linesCovered = parseInt(linesMatch[1]);
+            const linesTotal = parseInt(linesMatch[2]);
+            
+            if (!analysis.codeCoverage) {
+                analysis.codeCoverage = {
+                    coveragePercentage: Math.round((linesCovered / linesTotal) * 100),
+                    linesCovered: linesCovered,
+                    linesTotal: linesTotal,
+                    uncoveredLines: []
+                };
+            } else {
+                analysis.codeCoverage.linesCovered = linesCovered;
+                analysis.codeCoverage.linesTotal = linesTotal;
+            }
+        }
+        
+        // Extract uncovered lines
+        const uncoveredLinesMatch = coverageText.match(/Lines not covered: ([^\|]+)/);
+        if (uncoveredLinesMatch) {
+            const uncoveredText = uncoveredLinesMatch[1];
+            const uncoveredLines = uncoveredText.split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n));
+            
+            if (!analysis.codeCoverage) {
+                analysis.codeCoverage = {
+                    coveragePercentage: 0,
+                    linesCovered: 0,
+                    linesTotal: 0,
+                    uncoveredLines: uncoveredLines
+                };
+            } else {
+                analysis.codeCoverage.uncoveredLines = uncoveredLines;
+            }
+        }
+    }
+
+    /**
+     * Process system mode event
+     */
+    private static processSystemMode(analysis: LogAnalysis, eventType: string, relativeTimeMs: number): void {
+        const isEnter = eventType.includes('SYSTEM_MODE_ENTER');
+        analysis.timeline.push({
+            event: isEnter ? 'System Mode Enter' : 'System Mode Exit',
+            timeMs: relativeTimeMs
+        });
+    }
+
+    /**
+     * Process constructor event
+     */
+    private static processConstructor(analysis: LogAnalysis, eventType: string, parts: string[], relativeTimeMs: number): void {
+        const isEntry = eventType.includes('CONSTRUCTOR_ENTRY');
+        const className = parts[2] || 'Unknown Class';
+        
+        analysis.timeline.push({
+            event: isEntry ? 'Constructor Entry' : 'Constructor Exit',
+            timeMs: relativeTimeMs,
+            details: className
+        });
+    }
+
+    /**
+     * Process custom method event
+     */
+    private static processCustomMethod(analysis: LogAnalysis, eventType: string, parts: string[], relativeTimeMs: number): void {
+        const isEntry = eventType.includes('METHOD_ENTRY');
+        const methodName = parts[2] || 'Unknown Method';
+        
+        analysis.timeline.push({
+            event: isEntry ? 'Method Entry' : 'Method Exit',
+            timeMs: relativeTimeMs,
+            details: methodName
+        });
+    }
+
+    /**
+     * Process SOQL end event
+     */
+    private static processSoqlEnd(analysis: LogAnalysis, parts: string[], relativeTimeMs: number): void {
+        // Extract execution time if available
+        const durationMatch = parts.slice(2).join('|').match(/Duration=(\d+)/);
+        if (durationMatch) {
+            const durationMs = parseInt(durationMatch[1]);
+            analysis.summary.dbTimeMs += durationMs;
+            
+            analysis.timeline.push({
+                event: 'SOQL Query Completed',
+                timeMs: relativeTimeMs,
+                details: `Duration: ${durationMs}ms`
+            });
+        }
+    }
+
+    /**
+     * Process DML end event
+     */
+    private static processDmlEnd(analysis: LogAnalysis, parts: string[], relativeTimeMs: number): void {
+        // Extract execution time if available
+        const durationMatch = parts.slice(2).join('|').match(/Duration=(\d+)/);
+        if (durationMatch) {
+            const durationMs = parseInt(durationMatch[1]);
+            analysis.summary.dbTimeMs += durationMs;
+            
+            analysis.timeline.push({
+                event: 'DML Operation Completed',
+                timeMs: relativeTimeMs,
+                details: `Duration: ${durationMs}ms`
+            });
+        }
+    }
+
+    /**
+     * Finalize the analysis by computing derived metrics
+     */
+    private static finalizeAnalysis(
+        analysis: LogAnalysis, 
+        limitMap: Map<string, { used: number; total: number }>
+    ): LogAnalysis {
+        // Process limits data into a format for display
+        limitMap.forEach((value, key) => {
+            const percentage = value.total > 0 ? Math.round((value.used / value.total) * 100) : 0;
+            
+            analysis.limits.push({
+                name: key,
+                used: value.used,
+                total: value.total,
+                percentage
+            });
+        });
+        
+        // Sort limits by percentage usage (descending)
         analysis.limits.sort((a, b) => b.percentage - a.percentage);
+        
+        // Compute database calls total
+        analysis.summary.numDatabaseCalls = analysis.summary.numSoqlQueries + analysis.summary.numDmlStatements;
         
         return analysis;
     }
-    
+
     /**
      * Helper function to escape HTML to prevent XSS
      */
@@ -248,37 +699,38 @@ export class LogAnalyzerHandler {
         
         // Get the execution datetime from the log
         const executionDatetime = this.extractExecutionDatetime(rawLogText);
-        const formattedDatetime = executionDatetime.toLocaleString();
+        const formattedDatetime = executionDatetime ? executionDatetime.toLocaleString() : 'Unknown time';
         
-        // Prepare log text for storage in data attribute
-        const encodedLogText = JSON.stringify(rawLogText);
+        // Base 64 encode for data storage (not used directly, but useful to have)
+        const encodedLogText = Buffer.from(rawLogText).toString('base64');
         
-        // Start building the HTML with styles
-        let html = this.generateStyles();
-        
-        // Main container with collapsible header
-        html += `
-        <div class="log-analyzer" id="log_container_${uniqueId}" style="padding: 10px; border-radius: 6px; margin-bottom: 10px;">
+        // Start building the HTML
+        let html = `
+        <div class="log-analyzer">
+            ${this.generateCssStyles()}
+            
             ${this.generateCollapsibleHeader(analysis, formattedDatetime, uniqueId)}
-            <div class="collapsible-content" id="collapsible-content-${uniqueId}">
-                ${this.generateViewToggleButton(uniqueId)}
-                
+            
+            <div id="collapsible-content-${uniqueId}" class="collapsible-content">
                 <div id="analyzedLogView_${uniqueId}">
                     ${this.generateSummaryPanels(analysis, formatNumber)}
-                    ${this.generateLogDataScript(encodedLogText, uniqueId)}
-                    ${this.generateInfoMessage()}
+                    
                     ${this.generateGovernorLimitsSection(analysis)}
-                    ${this.generateDebugStatementsSection(analysis)}
-                    ${this.generateErrorsSection(analysis)}
+                    
+                    ${analysis.errors.length > 0 ? this.generateErrorsSection(analysis) : ''}
+                    
+                    ${analysis.debugLines.length > 0 ? this.generateDebugStatementsSection(analysis) : ''}
+                    
                     ${this.generateTimelineSection(analysis)}
                 </div>
                 
                 ${this.generateRawLogView(rawLogText, uniqueId)}
+                
+                ${this.generateLogDataScript(encodedLogText, uniqueId)}
             </div>
+            
+            ${this.generateJavaScript(uniqueId)}
         </div>`;
-        
-        // Add JavaScript for interactive elements
-        html += this.generateJavaScript(uniqueId);
         
         return html;
     }
@@ -309,7 +761,7 @@ export class LogAnalyzerHandler {
     /**
      * Generate CSS styles for the log analyzer
      */
-    private static generateStyles(): string {
+    private static generateCssStyles(): string {
         return `
         <style>
             .log-analyzer {
@@ -344,7 +796,90 @@ export class LogAnalyzerHandler {
             .log-analyzer .error-panel {
                 background-color: var(--vscode-inputValidation-errorBackground, rgba(255, 0, 0, 0.1));
                 border: 1px solid var(--vscode-inputValidation-errorBorder, rgba(255, 0, 0, 0.3));
+                border-radius: 4px;
+                padding: 12px;
             }
+            
+            /* Timeline styles */
+            .log-analyzer .timeline-container {
+                padding: 10px;
+            }
+            .log-analyzer .timeline-item {
+                padding: 2px 0;
+            }
+            .log-analyzer .timeline-error-item {
+                padding: 4px 6px;
+                border-radius: 3px;
+                background-color: var(--vscode-inputValidation-errorBackground, rgba(255, 0, 0, 0.05));
+                margin-left: -6px;
+                margin-right: -6px;
+            }
+            .log-analyzer .timeline-error-container {
+                width: 100%;
+            }
+            .log-analyzer .timeline-error-message {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                color: var(--vscode-errorForeground, #ff0000);
+                max-width: 100%;
+            }
+            .log-analyzer .timeline-toggle-btn {
+                background: none;
+                color: var(--vscode-button-foreground);
+                border: none;
+                border-radius: 3px;
+                padding: 1px 4px;
+                font-size: 10px;
+                cursor: pointer;
+                background-color: var(--vscode-button-background);
+                margin-left: 8px;
+                height: 18px;
+                min-width: 18px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .log-analyzer .timeline-toggle-btn:hover {
+                background-color: var(--vscode-button-hoverBackground);
+            }
+            .log-analyzer .timeline-error-details {
+                margin-top: 4px;
+                padding-top: 4px;
+            }
+            
+            /* New error section styling */
+            .log-analyzer .error-container {
+                margin-bottom: 16px;
+                padding-bottom: 8px;
+            }
+            .log-analyzer .error-container:not(:last-child) {
+                border-bottom: 1px dashed var(--vscode-inputValidation-errorBorder, rgba(255, 0, 0, 0.3));
+            }
+            .log-analyzer .error-message {
+                color: var(--vscode-errorForeground, #ff0000);
+                font-weight: bold;
+                margin-bottom: 4px;
+            }
+            .log-analyzer .error-location {
+                color: var(--vscode-descriptionForeground);
+                font-size: 12px;
+                margin-bottom: 8px;
+            }
+            .log-analyzer .stack-trace {
+                font-family: monospace;
+                font-size: 12px;
+                margin-top: 6px;
+                padding: 8px;
+                background-color: var(--vscode-editorWidget-background, rgba(0, 0, 0, 0.05));
+                border-radius: 3px;
+            }
+            .log-analyzer .stack-trace ul li {
+                padding: 3px 0;
+                white-space: pre-wrap;
+                word-break: break-all;
+            }
+            
             .log-analyzer summary {
                 color: var(--vscode-foreground);
                 font-weight: bold;
@@ -502,12 +1037,8 @@ export class LogAnalyzerHandler {
      * Generate the view toggle button
      */
     private static generateViewToggleButton(uniqueId: string): string {
-        return `
-        <div class="button-container">
-            <button id="viewToggleBtn_${uniqueId}" onclick="toggleLogView_${uniqueId}(event)">
-                View Raw Log
-            </button>
-        </div>`;
+        // Removed the toggle button as requested
+        return ``;
     }
     
     /**
@@ -618,9 +1149,12 @@ export class LogAnalyzerHandler {
         
         let debugItems = '';
         for (const debug of analysis.debugLines) {
+            // Handle the special case of multi-line debug messages with empty lines
+            // Pre-wrap the content with <pre> tag to preserve formatting exactly
             debugItems += `
-            <div style="margin-bottom: 4px;">
-                <span class="debug-line-number">Line ${debug.lineNumber}:</span> ${this.escapeHtml(debug.message)}
+            <div style="margin-bottom: 10px;">
+                <span class="debug-line-number">Line ${debug.lineNumber}:</span>
+                <pre class="debug-message" style="margin: 0; font-family: var(--vscode-editor-font-family, monospace); white-space: pre; overflow-x: auto;">${this.escapeHtml(debug.message)}</pre>
             </div>`;
         }
         
@@ -643,18 +1177,32 @@ export class LogAnalyzerHandler {
         
         let errorItems = '';
         for (const error of analysis.errors) {
+            // Format stack trace lines with line breaks
+            let formattedStackTrace = '';
+            if (error.stackTrace) {
+                const stackLines = error.stackTrace.split('\n');
+                formattedStackTrace = `
+                <div class="stack-trace">
+                    <hr style="border-color: var(--vscode-input-placeholderForeground, #888); margin: 8px 0;">
+                    <div style="font-weight: bold; margin-bottom: 4px;">Stack Trace:</div>
+                    <ul style="list-style-type: none; padding-left: 0; margin-top: 4px;">
+                        ${stackLines.map(line => `<li>${this.escapeHtml(line.trim())}</li>`).join('')}
+                    </ul>
+                </div>`;
+            }
+            
             errorItems += `
-            <div style="margin-bottom: 4px;" class="error-text">
-                ${this.escapeHtml(error.message)}
-                ${error.lineNumber ? `(Line ${error.lineNumber})` : ''}
-                ${error.stackTrace ? `<pre style="margin-top: 4px; white-space: pre-wrap;">${this.escapeHtml(error.stackTrace)}</pre>` : ''}
+            <div class="error-container">
+                <div class="error-message">${this.escapeHtml(error.message)}</div>
+                ${error.lineNumber ? `<div class="error-location">Line: ${error.lineNumber}${error.columnNumber ? `, Column: ${error.columnNumber}` : ''}</div>` : ''}
+                ${formattedStackTrace}
             </div>`;
         }
         
         return `
         <details open>
             <summary>❌ Errors</summary>
-            <div class="error-panel monospace" style="margin-bottom: 15px;">
+            <div class="error-panel" style="margin-bottom: 15px;">
                 ${errorItems}
             </div>
         </details>`;
@@ -677,18 +1225,54 @@ export class LogAnalyzerHandler {
             if (event.event.includes('Debug')) eventClass = 'event-debug';
             if (event.event.includes('Error')) eventClass = 'event-error';
             
-            timelineItems += `
-            <div style="margin-bottom: 4px; display: flex;">
-                <span class="dim-text" style="min-width: 60px;">${event.timeMs}ms</span>
-                <span class="${eventClass}">${event.event}</span>
-                ${event.details ? `: <span style="margin-left: 4px;">${this.escapeHtml(event.details)}</span>` : ''}
-            </div>`;
+            // For regular events
+            if (event.event !== 'Error') {
+                timelineItems += `
+                <div class="timeline-item" style="margin-bottom: 4px; display: flex;">
+                    <span class="dim-text" style="min-width: 60px;">${event.timeMs}ms</span>
+                    <span class="${eventClass}">${event.event}</span>
+                    ${event.details ? `: <span style="margin-left: 4px;">${this.escapeHtml(event.details)}</span>` : ''}
+                </div>`;
+            } 
+            // Special handling for errors (matching the errors section UI)
+            else if (event.details) {
+                // Find the matching error in the errors array to get stack trace and other details
+                const matchingError = analysis.errors.find(err => err.message === event.details);
+                
+                // Format stack trace lines with line breaks (same as in errors section)
+                let formattedStackTrace = '';
+                if (matchingError && matchingError.stackTrace) {
+                    const stackLines = matchingError.stackTrace.split('\n');
+                    formattedStackTrace = `
+                    <div class="stack-trace">
+                        <hr style="border-color: var(--vscode-input-placeholderForeground, #888); margin: 8px 0;">
+                        <div style="font-weight: bold; margin-bottom: 4px;">Stack Trace:</div>
+                        <ul style="list-style-type: none; padding-left: 0; margin-top: 4px;">
+                            ${stackLines.map(line => `<li>${this.escapeHtml(line.trim())}</li>`).join('')}
+                        </ul>
+                    </div>`;
+                }
+                
+                // Start with timestamp then add error with exact same format as error section
+                timelineItems += `
+                <div style="margin-bottom: 10px;">
+                    <div style="display: flex; align-items: flex-start;">
+                        <span class="dim-text" style="min-width: 60px;">${event.timeMs}ms</span>
+                        <div class="error-container" style="margin: 0; flex: 1;">
+                            <div class="error-message">${this.escapeHtml(event.details)}</div>
+                            ${matchingError && matchingError.lineNumber ? 
+                                `<div class="error-location">Line: ${matchingError.lineNumber}${matchingError.columnNumber ? `, Column: ${matchingError.columnNumber}` : ''}</div>` : ''}
+                            ${formattedStackTrace}
+                        </div>
+                    </div>
+                </div>`;
+            }
         }
         
         return `
         <details>
             <summary>⏰ Execution Timeline</summary>
-            <div class="panel monospace" style="max-height: 200px; overflow-y: auto;">
+            <div class="panel monospace" style="max-height: 300px; overflow-y: auto;">
                 ${timelineItems}
             </div>
         </details>`;
@@ -699,8 +1283,8 @@ export class LogAnalyzerHandler {
      */
     private static generateRawLogView(rawLogText: string, uniqueId: string): string {
         return `
-        <div id="rawLogView_${uniqueId}" style="display: none;">
-            <details open>
+        <div id="rawLogView_${uniqueId}">
+            <details>
                 <summary>📄 Full Log</summary>
                 <div class="panel monospace" style="margin-bottom: 15px; white-space: pre-wrap; overflow-x: auto; max-height: 500px; overflow-y: auto;">
                     ${this.escapeHtml(rawLogText)}
@@ -739,32 +1323,6 @@ export class LogAnalyzerHandler {
                     content.style.maxHeight = '0px';
                     icon.classList.add('collapsed');
                 }
-            }
-            
-            // View toggle functionality - note the event parameter to stop propagation
-            function toggleLogView_${uniqueId}(event) {
-                // Prevent the click from triggering the parent collapse function
-                event.stopPropagation();
-                
-                const analyzedView = document.getElementById('analyzedLogView_${uniqueId}');
-                const rawView = document.getElementById('rawLogView_${uniqueId}');
-                const toggleBtn = document.getElementById('viewToggleBtn_${uniqueId}');
-                
-                if (analyzedView.style.display === 'none') {
-                    analyzedView.style.display = 'block';
-                    rawView.style.display = 'none';
-                    toggleBtn.innerText = 'View Raw Log';
-                } else {
-                    analyzedView.style.display = 'none';
-                    rawView.style.display = 'block';
-                    toggleBtn.innerText = 'View Analysis';
-                }
-                
-                // Update content height after changing view
-                const content = document.getElementById('collapsible-content-${uniqueId}');
-                setTimeout(() => {
-                    content.style.maxHeight = content.scrollHeight + 'px';
-                }, 10);
             }
         </script>`;
     }
